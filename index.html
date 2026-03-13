@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>My Personal Kanban</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <div class="app-header-left">
+          <h1>My Personal Kanban</h1>
+          <p class="subtitle">Trello‑style boards for your own tasks</p>
+        </div>
+        <div class="app-header-right">
+          <input
+            id="search-input"
+            class="search-input"
+            type="search"
+            placeholder="Search tasks…"
+          />
+          <button id="theme-toggle" class="icon-button" title="Toggle theme">
+            🌙
+          </button>
+        </div>
+      </header>
+
+      <main class="app-main">
+        <aside class="sidebar">
+          <section class="panel">
+            <h2>Board</h2>
+            <label class="field">
+              <span class="field-label">Board name</span>
+              <input
+                id="board-name-input"
+                class="text-input"
+                type="text"
+                placeholder="e.g. Personal Tasks"
+              />
+            </label>
+          </section>
+
+          <section class="panel">
+            <h2>New column</h2>
+            <label class="field">
+              <span class="field-label">Title</span>
+              <input
+                id="new-column-title"
+                class="text-input"
+                type="text"
+                placeholder="e.g. Backlog"
+              />
+            </label>
+            <button id="add-column-btn" class="primary-button">
+              Add column
+            </button>
+          </section>
+
+          <section class="panel">
+            <h2>New task</h2>
+            <label class="field">
+              <span class="field-label">Title</span>
+              <input
+                id="task-title-input"
+                class="text-input"
+                type="text"
+                placeholder="What do you want to do?"
+              />
+            </label>
+            <label class="field">
+              <span class="field-label">Details</span>
+              <textarea
+                id="task-desc-input"
+                class="text-input"
+                rows="3"
+                placeholder="Optional description"
+              ></textarea>
+            </label>
+            <div class="field-inline">
+              <label class="field grow">
+                <span class="field-label">Due</span>
+                <input id="task-due-input" class="text-input" type="date" />
+              </label>
+              <label class="field">
+                <span class="field-label">Priority</span>
+                <select id="task-priority-input" class="text-input">
+                  <option value="low">Low</option>
+                  <option value="medium" selected>Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </label>
+            </div>
+            <label class="field">
+              <span class="field-label">Add to column</span>
+              <select id="task-column-select" class="text-input"></select>
+            </label>
+            <button id="add-task-btn" class="primary-button">
+              Add task
+            </button>
+          </section>
+        </aside>
+
+        <section class="board" id="board"></section>
+      </main>
+
+      <footer class="app-footer">
+        <span>All data is stored locally in this browser.</span>
+        <div class="footer-actions">
+          <input
+            id="import-board-input"
+            type="file"
+            accept=".json,application/json"
+            hidden
+          />
+          <button id="import-board-btn" class="ghost-button">
+            Import board
+          </button>
+          <button id="export-board-btn" class="ghost-button">
+            Export board
+          </button>
+          <button id="reset-board-btn" class="ghost-button">
+            Reset board
+          </button>
+        </div>
+      </footer>
+    </div>
+
+    <template id="column-template">
+      <article class="column" draggable="true">
+        <header class="column-header">
+          <h2 class="column-title"></h2>
+          <div class="column-actions">
+            <button class="icon-button column-edit-btn" title="Rename column">
+              ✏️
+            </button>
+            <button class="icon-button column-delete-btn" title="Delete column">
+              🗑
+            </button>
+          </div>
+        </header>
+        <div class="column-body">
+          <div class="column-dropzone"></div>
+        </div>
+        <footer class="column-footer">
+          <button class="ghost-button column-add-task-btn">
+            + Quick add task
+          </button>
+        </footer>
+      </article>
+    </template>
+
+    <template id="task-template">
+      <div class="task-card" draggable="true">
+        <header class="task-header">
+          <span class="task-title"></span>
+          <div class="task-actions">
+            <span class="task-priority-pill"></span>
+            <button class="icon-button task-edit-btn" title="Edit task">
+              ✏️
+            </button>
+            <button class="icon-button task-delete-btn" title="Delete task">
+              🗑
+            </button>
+          </div>
+        </header>
+        <p class="task-desc"></p>
+        <footer class="task-footer">
+          <span class="task-due"></span>
+        </footer>
+      </div>
+    </template>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>
