@@ -32,8 +32,9 @@ NEXT_SELECTORS = [
     "a:has-text('Next')",
     "input[value='Next']",
     "input[value='Continue']",
-    "[id*='next' i]",
-    "[class*='next' i]",
+    "input[type='button'][value*='next' i]",
+    "button[id*='next' i]",
+    "button[class*='next' i]",
     "[aria-label*='next' i]",
     "[title*='next' i]",
 ]
@@ -188,7 +189,7 @@ def get_claude_recommendation(client: anthropic.Anthropic, question_text: str) -
 
     with client.messages.stream(
         model=CLAUDE_MODEL,
-        max_tokens=300,
+        max_tokens=1024,
         thinking={"type": "adaptive"},
         system=system,
         messages=[
