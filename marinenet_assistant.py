@@ -1,61 +1,123 @@
 #!/usr/bin/env python3
 """
 MarineNet Course Assistant
-Handles tedious navigation so you can focus on the content.
-You log in with your CAC, the assistant handles clicking through slides,
-pauses on questions, and gives you a recommended answer + brief explanation
-via Claude so you can learn from it before selecting your own answer.
+Handles tedious navigation so you can focus on reading the content.
+You log in with your CAC, the assistant clicks through slides for you,
+pauses on real questions, and gives you Claude's recommended answer
+with a brief explanation so you can learn from it.
 """
 
 import asyncio
+import hashlib
 import os
 import re
 import sys
 from datetime import datetime
 
 import anthropic
-from playwright.async_api import async_playwright, Page, Frame
+from playwright.async_api import async_playwright, Page, Frame, ElementHandle
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MARINENET_URL = "https://www.marinenet.usmc.mil"
 
-# How long to wait (ms) after clicking Next before looking for new content
-NAV_SETTLE_MS = 1500
+# Settle time after clicking (seconds)
+NAV_SETTLE_SEC = 2.0
 
-# Claude model used for question analysis
-CLAUDE_MODEL = "claude-opus-4-6"
+# Extra wait for slow SCORM loads
+SCORM_LOAD_SEC = 3.0
 
-# Selectors tuned for common MarineNet / SCORM patterns
+# Claude model for question analysis
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# Max consecutive times we can see the same content before asking for help
+MAX_STUCK_COUNT = 3
+
+# ── Navigation selectors (ordered by likelihood) ─────────────────────────────
+# These cover common SCORM player patterns, Articulate Storyline, Adobe Captivate, etc.
 NEXT_SELECTORS = [
-    "button:has-text('Next')",
-    "button:has-text('Continue')",
-    "a:has-text('Next')",
-    "input[value='Next']",
-    "input[value='Continue']",
-    "input[type='button'][value*='next' i]",
+    # Standard SCORM player buttons
     "button[id*='next' i]",
-    "button[class*='next' i]",
+    "button[id*='Next']",
+    "a[id*='next' i]",
+    "input[id*='next' i]",
+    # Text-based
+    "button:has-text('Next')",
+    "button:has-text('NEXT')",
+    "a:has-text('Next')",
+    "a:has-text('NEXT')",
+    "input[value='Next']",
+    "input[value='NEXT']",
+    "button:has-text('Continue')",
+    "a:has-text('Continue')",
+    "input[value='Continue']",
+    # Aria / title
     "[aria-label*='next' i]",
-    "[title*='next' i]",
+    "[aria-label*='Next']",
+    "[title*='Next']",
+    "[title*='next page' i]",
+    "[title*='forward' i]",
+    # Class-based
+    "button[class*='next' i]",
+    "a[class*='next' i]",
+    "[class*='nav-next' i]",
+    "[class*='navNext' i]",
+    "[class*='btn-next' i]",
+    "[class*='btnNext' i]",
+    # Arrow / icon buttons (Articulate, Captivate)
+    "button[class*='right-arrow' i]",
+    "button[class*='forward' i]",
+    "[class*='arrow-right' i]",
+    "[class*='slide-forward' i]",
+    # Generic play/advance
+    "button:has-text('Proceed')",
+    "button:has-text('Advance')",
+    "button:has-text('Start')",
+    "a:has-text('Proceed')",
+    # Articulate Storyline specific
+    "[data-acc-text*='next' i]",
+    "[data-ref='next']",
+    # Common icon-only next buttons (right chevron, etc.)
+    "button[class*='chevron-right' i]",
+    "button[class*='fa-chevron-right']",
+    "button[class*='fa-arrow-right']",
 ]
 
-QUESTION_SIGNALS = [
-    "[class*='question' i]",
-    "[class*='quiz' i]",
-    "[class*='assessment' i]",
-    "[id*='question' i]",
+# Selectors that ONLY match actual interactive answer inputs
+ANSWER_INPUT_SELECTORS = [
     "input[type='radio']",
     "input[type='checkbox']",
-    "[class*='answer' i]",
-    "[class*='choice' i]",
+]
+
+# Additional confirmation: elements that wrap quiz questions
+QUIZ_CONTAINER_SELECTORS = [
+    "[class*='quiz' i]",
+    "[class*='assessment' i]",
+    "[class*='exam' i]",
+    "[class*='test' i][class*='question' i]",
+    "[id*='quiz' i]",
+    "[id*='assessment' i]",
 ]
 
 SUBMIT_SELECTORS = [
     "button:has-text('Submit')",
     "input[value='Submit']",
+    "button:has-text('Check Answer')",
     "button:has-text('Check')",
-    "button:has-text('OK')",
+    "button:has-text('Confirm')",
+    "input[value='Submit Answer']",
+    "button[id*='submit' i]",
 ]
+
+# Things to click away (popups, modals, confirmations)
+DISMISS_SELECTORS = [
+    "button:has-text('OK')",
+    "button:has-text('Close')",
+    "button:has-text('Got it')",
+    "button:has-text('Dismiss')",
+    "[class*='modal'] button[class*='close' i]",
+    "[class*='dialog'] button[class*='close' i]",
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,52 +130,76 @@ def banner(msg: str, char: str = "─") -> None:
 
 def status(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}]  {msg}")
+    print(f"  [{ts}]  {msg}")
 
 
-def prompt_user(question: str) -> str:
-    print(f"\n{'▶' * 3}  {question}")
-    return input("    Your input → ").strip()
+def content_hash(text: str) -> str:
+    """Hash page text to detect if we're stuck on the same slide."""
+    cleaned = re.sub(r'\s+', ' ', text.strip().lower())
+    return hashlib.md5(cleaned.encode()).hexdigest()[:12]
 
 
-async def find_in_frames(page: Page, selector: str) -> list:
-    """Search for a selector across the main page and all nested iframes."""
+def get_all_frames(page: Page) -> list[Frame]:
+    """Get all frames including nested iframes."""
+    frames = []
+    seen = set()
+
+    def collect(frame: Frame):
+        fid = id(frame)
+        if fid in seen:
+            return
+        seen.add(fid)
+        frames.append(frame)
+        for child in frame.child_frames:
+            collect(child)
+
+    collect(page.main_frame)
+    return frames
+
+
+async def find_in_frames(page: Page, selector: str) -> list[tuple[Frame, ElementHandle]]:
+    """Search for a selector across the main page and all nested iframes.
+    Returns list of (frame, element) tuples."""
     results = []
-    frames: list[Frame] = [page.main_frame]
-    seen_urls: set[str] = set()
-
-    while frames:
-        frame = frames.pop()
-        if frame.url in seen_urls:
-            continue
-        seen_urls.add(frame.url)
-
+    for frame in get_all_frames(page):
         try:
             els = await frame.query_selector_all(selector)
-            results.extend(els)
+            for el in els:
+                results.append((frame, el))
         except Exception:
             pass
-
-        try:
-            child_frames = frame.child_frames
-            frames.extend(child_frames)
-        except Exception:
-            pass
-
     return results
 
 
+async def count_visible(page: Page, selector: str) -> int:
+    """Count visible elements matching selector across all frames."""
+    count = 0
+    for frame in get_all_frames(page):
+        try:
+            els = await frame.query_selector_all(selector)
+            for el in els:
+                try:
+                    if await el.is_visible():
+                        count += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return count
+
+
 async def click_first_visible(page: Page, selectors: list[str]) -> bool:
-    """Try each selector; click the first visible, enabled match. Returns True if clicked."""
+    """Try each selector; click the first visible, enabled match."""
     for sel in selectors:
         try:
-            elements = await find_in_frames(page, sel)
-            for el in elements:
+            results = await find_in_frames(page, sel)
+            for frame, el in results:
                 try:
                     visible = await el.is_visible()
                     enabled = await el.is_enabled()
                     if visible and enabled:
                         await el.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.2)
                         await el.click()
                         return True
                 except Exception:
@@ -123,38 +209,99 @@ async def click_first_visible(page: Page, selectors: list[str]) -> bool:
     return False
 
 
-async def page_has_question(page: Page) -> bool:
-    """Return True if the current view looks like it contains a question."""
-    for sel in QUESTION_SIGNALS:
-        elements = await find_in_frames(page, sel)
-        for el in elements:
+async def is_real_question(page: Page) -> bool:
+    """
+    Determine if the current page has an ACTUAL question with answer choices.
+
+    The key insight: a real question page has VISIBLE radio buttons or checkboxes
+    that the user needs to interact with. We require at least 2 visible radio/checkbox
+    inputs — that's the universal signal for a multiple-choice question regardless
+    of how the SCORM package styles things.
+    """
+    # Primary check: are there 2+ visible radio buttons or checkboxes?
+    radio_count = await count_visible(page, "input[type='radio']")
+    checkbox_count = await count_visible(page, "input[type='checkbox']")
+
+    if radio_count >= 2 or checkbox_count >= 2:
+        return True
+
+    # Secondary check: clickable answer-choice elements (some SCORM packages
+    # use styled divs/buttons instead of native inputs)
+    # Look for multiple sibling elements that look like answer choices
+    for frame in get_all_frames(page):
+        try:
+            # Articulate Storyline pattern: buttons with answer text
+            choice_patterns = [
+                "[class*='choice' i][role='button']",
+                "[class*='answer' i][role='button']",
+                "[class*='option' i][role='radio']",
+                "[role='radio']",
+                "[role='option']",
+                "label[class*='choice' i]",
+                "label[class*='answer' i]",
+                "[class*='mcq'] [class*='option' i]",
+            ]
+            for pattern in choice_patterns:
+                try:
+                    els = await frame.query_selector_all(pattern)
+                    visible_count = 0
+                    for el in els:
+                        try:
+                            if await el.is_visible():
+                                visible_count += 1
+                        except Exception:
+                            pass
+                    if visible_count >= 2:
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Check for quiz container + any interactive element
+    for sel in QUIZ_CONTAINER_SELECTORS:
+        containers = await find_in_frames(page, sel)
+        for frame, container in containers:
             try:
-                if await el.is_visible():
-                    return True
+                if await container.is_visible():
+                    # There's a visible quiz container — check for any input inside
+                    inner = await container.query_selector_all("input, select, [role='radio'], [role='checkbox']")
+                    if len(inner) >= 2:
+                        return True
             except Exception:
-                continue
+                pass
+
     return False
 
 
-async def get_visible_text(page: Page, max_chars: int = 2000) -> str:
-    """Pull readable text from the page / active frame for display."""
-    frames: list[Frame] = [page.main_frame]
-    text_parts: list[str] = []
-    seen: set[str] = set()
+async def get_question_text(page: Page, max_chars: int = 3000) -> str:
+    """Extract text specifically from question/answer areas if possible,
+    falling back to full page text."""
+    # Try to get text from quiz containers first
+    for sel in QUIZ_CONTAINER_SELECTORS:
+        results = await find_in_frames(page, sel)
+        for frame, el in results:
+            try:
+                if await el.is_visible():
+                    text = await el.inner_text()
+                    if text and len(text.strip()) > 20:
+                        return text.strip()[:max_chars]
+            except Exception:
+                pass
 
-    while frames:
-        frame = frames.pop()
-        if frame.url in seen:
-            continue
-        seen.add(frame.url)
+    # Fall back to getting all visible text
+    return await get_visible_text(page, max_chars)
+
+
+async def get_visible_text(page: Page, max_chars: int = 2000) -> str:
+    """Pull readable text from the page / active frames."""
+    text_parts = []
+
+    for frame in get_all_frames(page):
         try:
             t = await frame.inner_text("body")
-            if t:
+            if t and t.strip():
                 text_parts.append(t.strip())
-        except Exception:
-            pass
-        try:
-            frames.extend(frame.child_frames)
         except Exception:
             pass
 
@@ -164,13 +311,54 @@ async def get_visible_text(page: Page, max_chars: int = 2000) -> str:
     return combined[:max_chars]
 
 
-# ── Claude question advisor ───────────────────────────────────────────────────
+async def dismiss_popups(page: Page) -> None:
+    """Try to close any modal/popup that might be blocking."""
+    for sel in DISMISS_SELECTORS:
+        try:
+            results = await find_in_frames(page, sel)
+            for frame, el in results:
+                try:
+                    if await el.is_visible():
+                        await el.click()
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+async def try_advance(page: Page) -> bool:
+    """Try all methods to advance to the next slide."""
+    # First try standard next buttons
+    if await click_first_visible(page, NEXT_SELECTORS):
+        return True
+
+    # Try dismissing a popup first, then retry
+    await dismiss_popups(page)
+    await asyncio.sleep(0.5)
+    if await click_first_visible(page, NEXT_SELECTORS):
+        return True
+
+    # Try keyboard navigation (some SCORM players support this)
+    try:
+        for frame in get_all_frames(page):
+            try:
+                await frame.press("body", "ArrowRight")
+                await asyncio.sleep(1.0)
+                return True  # Can't be sure it worked, caller checks via hash
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return False
+
+
+# ── Claude question advisor ──────────────────────────────────────────────────
 
 def get_claude_recommendation(client: anthropic.Anthropic, question_text: str) -> str:
     """
-    Ask Claude to identify the best answer to a MarineNet question and
-    briefly explain why — so the learner understands the reasoning.
-    Streams the response and returns the full text.
+    Ask Claude to identify the best answer and explain why.
     """
     system = (
         "You are a knowledgeable Marine Corps training advisor. "
@@ -178,19 +366,19 @@ def get_claude_recommendation(client: anthropic.Anthropic, question_text: str) -
         "you will:\n"
         "1. State the recommended answer clearly (e.g. 'Recommended answer: B – <option text>').\n"
         "2. Give a concise 2-4 sentence explanation of WHY that answer is correct, "
-        "referencing the relevant Marine Corps doctrine, regulation, or principle when applicable.\n"
+        "referencing relevant Marine Corps doctrine, regulation, or principle when applicable.\n"
         "3. If relevant, briefly note why the other choices are wrong.\n"
         "Keep your response under 150 words. Be direct and educational."
     )
 
     full_text = ""
-    print("\n  ┌─ Claude's Recommendation ──────────────────────────────────────")
+    print()
+    print("  ┌─ Claude's Recommendation ──────────────────────────────────────")
     print("  │")
 
     with client.messages.stream(
         model=CLAUDE_MODEL,
         max_tokens=1024,
-        thinking={"type": "adaptive"},
         system=system,
         messages=[
             {
@@ -205,126 +393,157 @@ def get_claude_recommendation(client: anthropic.Anthropic, question_text: str) -
     ) as stream:
         for text in stream.text_stream:
             full_text += text
-            # Indent each streamed chunk under the box border
-            print(f"\r  │  {full_text.splitlines()[-1] if full_text.splitlines() else ''}", end="", flush=True)
 
-    # Reprint neatly with proper line wrapping
-    print("\r" + " " * 78, end="\r")  # clear the streaming line
+    # Print neatly
     for line in full_text.splitlines():
         print(f"  │  {line}")
+    print("  │")
     print("  └" + "─" * 65)
 
     return full_text
 
 
+# ── Core loop ────────────────────────────────────────────────────────────────
+
 async def wait_for_user_navigation(page: Page) -> None:
     banner("Waiting for you to open a course…", "═")
-    print("  1. Log in with your CAC in the browser window that just opened.")
-    print("  2. Navigate to the course you want to take.")
-    print("  3. Press  ENTER  here once you're on the course's first slide/page.\n")
-    input("  → Press ENTER when ready: ")
+    print("  1. Log in with your CAC in the browser window.")
+    print("  2. Navigate to the course and open the first lesson/slide.")
+    print("  3. Come back here and press ENTER.\n")
+    input("  → Press ENTER when you're on the first slide: ")
 
 
-# ── Core loop ─────────────────────────────────────────────────────────────────
-
-async def run_course(page: Page, claude: anthropic.Anthropic) -> None:
+async def run_course(page: Page, claude: anthropic.Anthropic | None) -> None:
     slide_number = 0
-    completed = False
+    last_hash = ""
+    stuck_count = 0
 
-    while not completed:
+    banner("Course assistant is running", "═")
+    print("  • Content slides: auto-advancing (you just read the browser)")
+    print("  • Questions: will pause and show Claude's recommendation")
+    print("  • Press Ctrl+C at any time to stop\n")
+
+    while True:
         slide_number += 1
         await page.wait_for_load_state("domcontentloaded")
-        await asyncio.sleep(NAV_SETTLE_MS / 1000)
+        await asyncio.sleep(NAV_SETTLE_SEC)
 
-        # ── Detect question ────────────────────────────────────────────────
-        if await page_has_question(page):
-            banner(f"QUESTION DETECTED  (slide ~{slide_number})", "★")
-            text = await get_visible_text(page, max_chars=3000)
+        # Get current page text and check if we're stuck
+        text = await get_visible_text(page, max_chars=2000)
+        current_hash = content_hash(text)
 
-            # Print the question text
-            print("\n" + text + "\n")
+        if current_hash == last_hash:
+            stuck_count += 1
+            if stuck_count >= MAX_STUCK_COUNT:
+                banner(f"Stuck on the same content (tried {stuck_count} times)", "!")
+                print("  The page isn't advancing. Possible reasons:")
+                print("  • Course is complete")
+                print("  • Navigation button has an unusual pattern")
+                print("  • A popup or modal is blocking")
+                print("  • Content requires interaction before advancing\n")
+                choice = input("  [r] retry  |  [m] I'll advance manually  |  [q] quit → ").strip().lower()
+                if choice == "q":
+                    break
+                elif choice == "m":
+                    input("  → Advance the course manually, then press ENTER: ")
+                    stuck_count = 0
+                    last_hash = ""
+                    continue
+                else:
+                    stuck_count = 0
+                    await dismiss_popups(page)
+                    continue
+        else:
+            stuck_count = 0
+            last_hash = current_hash
 
-            # Ask Claude for a recommendation (runs synchronously in a thread
-            # so the async event loop isn't blocked)
-            status("Asking Claude for a recommendation…")
-            try:
-                await asyncio.to_thread(get_claude_recommendation, claude, text)
-            except Exception as exc:
-                print(f"\n  [Claude unavailable: {exc}]")
+        # ── Check for a REAL question ─────────────────────────────────────
+        if await is_real_question(page):
+            banner(f"✦ QUESTION  (slide ~{slide_number})", "★")
+
+            question_text = await get_question_text(page)
+            # Show the question text
+            print()
+            for line in question_text.splitlines()[:30]:
+                if line.strip():
+                    print(f"    {line.strip()}")
+            print()
+
+            # Get Claude's recommendation
+            if claude:
+                status("Asking Claude for a recommendation…")
+                try:
+                    await asyncio.to_thread(get_claude_recommendation, claude, question_text)
+                except Exception as exc:
+                    print(f"\n  [Claude error: {exc}]")
+            else:
+                print("  (No API key — Claude recommendations unavailable)")
 
             print()
-            print("  Read the question and Claude's suggestion above.")
-            print("  Make your own selection in the browser, then press ENTER.")
+            print("  ➤ Select your answer in the browser window.")
+            input("  → Press ENTER when you've answered: ")
 
-            input("\n  → Press ENTER when you've answered and are ready to move on: ")
+            # Try to submit
+            clicked_submit = await click_first_visible(page, SUBMIT_SELECTORS)
+            if clicked_submit:
+                status("Clicked Submit for you.")
+                await asyncio.sleep(NAV_SETTLE_SEC)
+                # After submit, try to dismiss result popups and advance
+                await dismiss_popups(page)
+                await asyncio.sleep(1.0)
 
-            # Try to submit / confirm if a submit button is present
-            clicked = await click_first_visible(page, SUBMIT_SELECTORS)
-            if clicked:
-                status("Clicked Submit / Check button for you.")
-                await asyncio.sleep(NAV_SETTLE_MS / 1000)
-            continue  # re-evaluate the page after answering
+            # Try to advance past the question
+            await try_advance(page)
+            await asyncio.sleep(NAV_SETTLE_SEC)
+            last_hash = ""  # Reset hash after question
+            continue
 
-        # ── Regular content slide ──────────────────────────────────────────
-        text = await get_visible_text(page, max_chars=1500)
+        # ── Regular content slide — auto-advance ──────────────────────────
+        # Show a brief preview in terminal so user knows what slide we're on
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        preview = lines[0] if lines else "(no text detected)"
+        if len(preview) > 80:
+            preview = preview[:77] + "…"
+        status(f"Slide {slide_number}: {preview}")
 
-        banner(f"Slide {slide_number}", "─")
-        lines = [l for l in text.splitlines() if l.strip()]
-        preview = "\n".join(lines[:20])
-        if len(lines) > 20:
-            preview += f"\n  … ({len(lines) - 20} more lines — see browser for full content)"
-        print(preview)
-
-        # ── Advance ───────────────────────────────────────────────────────
-        clicked = await click_first_visible(page, NEXT_SELECTORS)
-
-        if clicked:
-            status("Clicked Next ↓")
+        # Auto-advance
+        advanced = await try_advance(page)
+        if advanced:
+            status("  → Advanced ✓")
         else:
-            banner("No 'Next' button found", "!")
-            print("  Possible reasons:")
-            print("  • This is the last slide — course complete!")
-            print("  • The button has an unusual label.")
-            print("  • Content is still loading.\n")
-            choice = prompt_user("Options:  [r] retry  |  [s] skip/manual  |  [q] quit")
-            if choice.lower() == "q":
-                break
-            elif choice.lower() == "r":
-                slide_number -= 1
-                continue
-            else:
-                input("  → Advance the course manually, then press ENTER: ")
+            status("  → No next button found, waiting…")
+            await asyncio.sleep(1.0)
 
-    banner("Session ended. Check the browser — you may be done!", "═")
+        await asyncio.sleep(NAV_SETTLE_SEC)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 async def main() -> None:
     banner("MarineNet Course Assistant", "═")
-    print("  This tool handles navigation so you can focus on the content.")
-    print("  For every question, Claude will suggest an answer and explain why.")
-    print("  You still make the final selection yourself.\n")
+    print("  Handles clicking through slides so you can focus on reading.")
+    print("  Pauses on questions and shows Claude's recommended answer.\n")
 
-    # Validate API key up front
+    # Validate API key
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("  ⚠  ANTHROPIC_API_KEY not set.")
-        print("     Export it before running:  export ANTHROPIC_API_KEY=sk-ant-...")
-        print("     Question hints will be skipped if unavailable.\n")
+        print("     export ANTHROPIC_API_KEY=sk-ant-...")
+        print("     Questions will still pause but without recommendations.\n")
 
     claude = anthropic.Anthropic(api_key=api_key) if api_key else None
 
     async with async_playwright() as pw:
+        # Launch browser
         try:
             browser = await pw.chromium.launch(
                 channel="chrome",
                 headless=False,
-                args=["--enable-features=SecurityKeyAPI", "--no-sandbox"],
+                args=["--no-sandbox"],
             )
             status("Launched Google Chrome.")
         except Exception:
-            status("Google Chrome not found, using bundled Chromium.")
+            status("Chrome not found, using bundled Chromium.")
             browser = await pw.chromium.launch(
                 headless=False,
                 args=["--no-sandbox"],
@@ -336,21 +555,22 @@ async def main() -> None:
         )
         page = await context.new_page()
 
-        status(f"Opening {MARINENET_URL} …")
+        status(f"Opening {MARINENET_URL}…")
         try:
             await page.goto(MARINENET_URL, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
-            status(f"Could not reach {MARINENET_URL}: {exc}")
-            status("The browser is open — navigate there manually.")
+            status(f"Could not reach MarineNet: {exc}")
+            status("Navigate there manually in the browser window.")
 
         await wait_for_user_navigation(page)
 
         try:
             await run_course(page, claude)
         except KeyboardInterrupt:
-            print("\n\nInterrupted by user.")
+            print("\n\n  Stopped by user.")
         finally:
-            input("\nPress ENTER to close the browser: ")
+            banner("Session complete", "═")
+            input("  Press ENTER to close the browser: ")
             await browser.close()
 
 
